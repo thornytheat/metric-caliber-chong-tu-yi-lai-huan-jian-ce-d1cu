@@ -12,7 +12,18 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import conflict, expr, gate, graph as graph_mod, registry, report, seed, settings, store
+from . import (
+    batch as batch_mod,
+    conflict,
+    expr,
+    gate,
+    graph as graph_mod,
+    registry,
+    report,
+    seed,
+    settings,
+    store,
+)
 
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
@@ -82,6 +93,12 @@ class RegistryRequest(BaseModel):
     description: str = ""
     published: bool = False
     allow_missing_reference: bool = False
+
+
+class BatchRequest(BaseModel):
+    candidates: list[str] = Field(default_factory=list)
+    idempotency_key: str | None = None
+    note: str = ""
 
 
 # --------------------------------------------------------------------------- 页面
@@ -204,6 +221,7 @@ def review(request: Request) -> HTMLResponse:
         impact = store.latest_impact(conn)
         events = store.list_events(conn, limit=25)
         checks = store.list_checks(conn, limit=8)
+        batches = store.list_batches(conn, limit=8)
     context = {
         "app_name": settings.APP_NAME,
         "app_short": settings.APP_SHORT,
@@ -213,12 +231,46 @@ def review(request: Request) -> HTMLResponse:
         "impact": impact,
         "events": events,
         "checks": checks,
+        "batches": batches,
         "error": None,
         "notice": None,
         "page": "review",
         "active": "review",
     }
     return templates.TemplateResponse(request, "review.html", context)
+
+
+@app.get("/batches", response_class=HTMLResponse)
+def batches_page(request: Request) -> HTMLResponse:
+    metrics = load_metrics()
+    with store.session() as conn:
+        store.init_schema(conn)
+        batches = store.list_batches(conn, limit=20)
+        detail = None
+        items = []
+        requested = request.query_params.get("batch_id")
+        if requested:
+            detail = store.get_batch(conn, requested)
+            if detail is not None:
+                items = store.batch_items(conn, requested)
+    unpublished = [metric for metric in metrics if not metric["published"]]
+    context = {
+        "app_name": settings.APP_NAME,
+        "app_short": settings.APP_SHORT,
+        "overview": report.overview(metrics),
+        "metrics": metrics,
+        "unpublished": unpublished,
+        "batches": batches,
+        "detail": detail,
+        "items": items,
+        "requested": requested,
+        "missing": bool(requested and detail is None),
+        "error": None,
+        "notice": None,
+        "page": "batches",
+        "active": "batches",
+    }
+    return templates.TemplateResponse(request, "batches.html", context)
 
 
 # --------------------------------------------------------------------------- 注册表
@@ -513,6 +565,119 @@ def api_publish(payload: PublishRequest) -> JSONResponse:
         )
     result["published"] = True
     return JSONResponse(status_code=200, content=result)
+
+
+# --------------------------------------------------------------------------- 发布批次
+
+
+def _batch_http_error(exc: batch_mod.BatchError):  # noqa: ANN202 - FastAPI 异常
+    if isinstance(exc, batch_mod.BatchNotFound):
+        raise HTTPException(status_code=404, detail={"error": exc.message})
+    if isinstance(exc, batch_mod.BatchConflict):
+        raise HTTPException(status_code=409, detail={"error": exc.message})
+    raise HTTPException(status_code=400, detail={"error": exc.message})
+
+
+@app.post("/api/batches", status_code=201)
+def api_create_batch(payload: BatchRequest) -> JSONResponse:
+    """登记一组候选版本并立即按整批关系演练（不切换任何发布状态）。"""
+    metrics = load_metrics()
+    try:
+        batch = batch_mod.create_batch(
+            metrics, payload.candidates, payload.idempotency_key, payload.note
+        )
+    except batch_mod.BatchError as exc:
+        _batch_http_error(exc)
+    status = "rehearsed" if batch["ready"] else "blocked"
+    return JSONResponse(
+        status_code=201,
+        content={
+            "ok": True,
+            "batch_id": batch["batch_id"],
+            "idempotency_key": batch["idempotency_key"],
+            "status": status,
+            "ready": batch["ready"],
+            "replayed": batch["replayed"],
+            "fingerprint": batch["fingerprint"],
+            "candidates": batch["candidates"],
+            "rehearsal": batch["rehearsal"],
+            "items": batch["items"],
+        },
+    )
+
+
+@app.get("/api/batches")
+def api_list_batches() -> dict:
+    with store.session() as conn:
+        store.init_schema(conn)
+        batches = store.list_batches(conn, limit=20)
+    return {
+        "count": len(batches),
+        "batches": [batch_mod._summary(item) for item in batches],
+    }
+
+
+@app.get("/api/batches/{batch_id}")
+def api_batch_detail(batch_id: str) -> dict:
+    with store.session() as conn:
+        store.init_schema(conn)
+        batch = store.get_batch(conn, batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail=f"批次 {batch_id} 不存在")
+        payload = batch_mod._payload(conn, batch)
+    return payload
+
+
+@app.post("/api/batches/{batch_id}/rehearse")
+def api_rehearse_batch(batch_id: str) -> JSONResponse:
+    """在同一批次记录上重演练（不新增批次/版本/明细行）。"""
+    metrics = load_metrics()
+    try:
+        batch = batch_mod.rehearse_batch(batch_id, metrics)
+    except batch_mod.BatchError as exc:
+        _batch_http_error(exc)
+    return JSONResponse(
+        status_code=200,
+        content={
+            "ok": True,
+            "batch_id": batch["batch_id"],
+            "status": batch["status"],
+            "ready": batch["ready"],
+            "replayed": batch["replayed"],
+            "rehearsal": batch["rehearsal"],
+            "items": batch["items"],
+        },
+    )
+
+
+@app.post("/api/batches/{batch_id}/apply")
+def api_apply_batch(batch_id: str) -> JSONResponse:
+    """全部候选一次性切换为已发布；失败整体回滚并保留记录。"""
+    try:
+        batch = batch_mod.apply_batch(batch_id)
+    except batch_mod.BatchError as exc:
+        _batch_http_error(exc)
+    outcome = batch["status"]
+    code = 200
+    if outcome == "failed":
+        code = 409
+    elif outcome == "blocked":
+        code = 409
+    return JSONResponse(
+        status_code=code,
+        content={
+            "ok": outcome == "applied",
+            "batch_id": batch["batch_id"],
+            "idempotency_key": batch["idempotency_key"],
+            "status": outcome,
+            "replayed": batch["replayed"],
+            "candidates": batch["candidates"],
+            "result": batch["result"],
+            "rehearsal": batch["rehearsal"],
+            "items": batch["items"],
+            "applied_at": batch["applied_at"],
+        },
+    )
 
 
 @app.get("/api/metrics")

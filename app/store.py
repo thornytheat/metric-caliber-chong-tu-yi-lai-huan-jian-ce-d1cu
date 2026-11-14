@@ -50,6 +50,30 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS release_batches (
+    batch_id            TEXT PRIMARY KEY,
+    idempotency_key     TEXT NOT NULL UNIQUE,
+    request_fingerprint TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL,
+    candidates          TEXT NOT NULL,
+    rehearsal           TEXT NOT NULL DEFAULT '{}',
+    result              TEXT NOT NULL DEFAULT '{}',
+    fingerprint         TEXT NOT NULL DEFAULT '',
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    applied_at          TEXT
+);
+CREATE TABLE IF NOT EXISTS release_batch_items (
+    batch_id  TEXT NOT NULL,
+    key       TEXT NOT NULL,
+    ordinal   INTEGER NOT NULL,
+    status    TEXT NOT NULL DEFAULT 'candidate',
+    evidence  TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (batch_id, key),
+    FOREIGN KEY (batch_id) REFERENCES release_batches(batch_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_release_batch_items_order
+    ON release_batch_items (batch_id, ordinal);
 """
 
 
@@ -285,3 +309,165 @@ def list_events(conn: sqlite3.Connection, limit: int = 40) -> list[dict]:
         }
         for row in rows
     ]
+
+
+# --------------------------------------------------------------------------- 发布批次
+
+
+def _row_to_batch(row: sqlite3.Row) -> dict:
+    return {
+        "batch_id": row["batch_id"],
+        "idempotency_key": row["idempotency_key"],
+        "request_fingerprint": row["request_fingerprint"],
+        "status": row["status"],
+        "candidates": json.loads(row["candidates"] or "[]"),
+        "rehearsal": json.loads(row["rehearsal"] or "{}"),
+        "result": json.loads(row["result"] or "{}"),
+        "fingerprint": row["fingerprint"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "applied_at": row["applied_at"],
+    }
+
+
+def get_batch(conn: sqlite3.Connection, batch_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM release_batches WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+    return _row_to_batch(row) if row else None
+
+
+def get_batch_by_idempotency(
+    conn: sqlite3.Connection, idempotency_key: str
+) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM release_batches WHERE idempotency_key = ?", (idempotency_key,)
+    ).fetchone()
+    return _row_to_batch(row) if row else None
+
+
+def latest_batch(conn: sqlite3.Connection) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM release_batches ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    ).fetchone()
+    return _row_to_batch(row) if row else None
+
+
+def list_batches(conn: sqlite3.Connection, limit: int = 10) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM release_batches ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [_row_to_batch(row) for row in rows]
+
+
+def insert_batch(conn: sqlite3.Connection, batch: dict, now: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO release_batches (batch_id, idempotency_key, request_fingerprint,
+                                     status, candidates, rehearsal, result, fingerprint,
+                                     created_at, updated_at, applied_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        """,
+        (
+            batch["batch_id"],
+            batch["idempotency_key"],
+            batch.get("request_fingerprint", ""),
+            batch["status"],
+            json.dumps(batch.get("candidates", []), ensure_ascii=False),
+            json.dumps(batch.get("rehearsal", {}), ensure_ascii=False),
+            json.dumps(batch.get("result", {}), ensure_ascii=False),
+            batch.get("fingerprint", ""),
+            now,
+            now,
+        ),
+    )
+
+
+def update_batch(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    *,
+    status: str | None = None,
+    rehearsal: dict | None = None,
+    result: dict | None = None,
+    applied_at: str | None = None,
+    now: str,
+) -> None:
+    parts = ["updated_at = ?"]
+    values: list = [now]
+    if status is not None:
+        parts.append("status = ?")
+        values.append(status)
+    if rehearsal is not None:
+        parts.append("rehearsal = ?")
+        values.append(json.dumps(rehearsal, ensure_ascii=False))
+    if result is not None:
+        parts.append("result = ?")
+        values.append(json.dumps(result, ensure_ascii=False))
+    if applied_at is not None:
+        parts.append("applied_at = ?")
+        values.append(applied_at)
+    values.append(batch_id)
+    conn.execute(
+        f"UPDATE release_batches SET {', '.join(parts)} WHERE batch_id = ?", values
+    )
+
+
+def replace_batch_items(conn: sqlite3.Connection, batch_id: str, items: list[dict]) -> None:
+    conn.execute("DELETE FROM release_batch_items WHERE batch_id = ?", (batch_id,))
+    for ordinal, item in enumerate(items):
+        conn.execute(
+            "INSERT INTO release_batch_items (batch_id, key, ordinal, status, evidence) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                batch_id,
+                item["key"],
+                ordinal,
+                item.get("status", "candidate"),
+                json.dumps(item.get("evidence", {}), ensure_ascii=False),
+            ),
+        )
+
+
+def count_batch_items(conn: sqlite3.Connection, batch_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM release_batch_items WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+    return int(row["c"])
+
+
+def batch_items(conn: sqlite3.Connection, batch_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT key, ordinal, status, evidence FROM release_batch_items "
+        "WHERE batch_id = ? ORDER BY ordinal ASC",
+        (batch_id,),
+    ).fetchall()
+    return [
+        {
+            "key": row["key"],
+            "ordinal": int(row["ordinal"]),
+            "status": row["status"],
+            "evidence": json.loads(row["evidence"] or "{}"),
+        }
+        for row in rows
+    ]
+
+
+def list_metrics_for_keys(
+    conn: sqlite3.Connection, keys: list[str]
+) -> list[dict]:
+    """按批次候选键读取实际落库的指标版本（用于切换后核对）。"""
+    found: list[dict] = []
+    for key in keys:
+        name, _, version = key.partition("@")
+        metric = get_metric(conn, name, int(version or 1))
+        if metric is not None:
+            found.append(metric)
+    return found
+
+
+def begin_immediate(conn: sqlite3.Connection) -> None:
+    """串行化批次写入：切换与状态更新放在同一个独占事务里。"""
+    conn.execute("BEGIN IMMEDIATE")
+

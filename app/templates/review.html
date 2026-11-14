@@ -195,6 +195,40 @@
 
     <section class="panel">
       <div class="panel-head">
+        <h2>批次发布</h2>
+        <div class="panel-actions">
+          <span class="tag">同一批一次性切换</span>
+          <a class="btn secondary small" href="/batches">去批次发布</a>
+        </div>
+      </div>
+      {% if batches %}
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>批次</th><th>状态</th><th>候选</th><th class="nowrap">阻断 / 下游 / breaking</th><th>尝试</th><th></th></tr></thead>
+          <tbody>
+          {% for item in batches %}
+            <tr>
+              <td class="nowrap"><a class="mono" href="/batches?batch_id={{ item.batch_id }}">{{ item.batch_id }}</a><div class="small muted">{{ item.idempotency_key }}</div></td>
+              <td><span class="tag {% if item.status == 'applied' %}ok{% elif item.status == 'failed' %}warn{% else %}err{% endif %}">{{ item.status }}</span></td>
+              <td class="small">{{ item.candidates | join('、') }}</td>
+              <td class="small nowrap">{{ item.rehearsal.blockers | length }} / {{ item.rehearsal.downstream_count }} / {{ item.rehearsal.breaking_count }}</td>
+              <td class="num">{{ item.result.attempts or 0 }}</td>
+              <td class="nowrap"><a class="btn secondary small" href="/batches?batch_id={{ item.batch_id }}">逐项依据</a></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="empty">
+        <strong>还没有批次记录</strong>
+        把要一起上线的候选版本带到 <a href="/batches">批次发布</a>：先整批演练，全部通过后一次性切换。
+      </div>
+      {% endif %}
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
         <h2>版本历史与历史体检</h2>
         <div class="panel-actions"><span class="tag">{{ events | length }} 事件 · {{ checks | length }} 次体检</span></div>
       </div>
